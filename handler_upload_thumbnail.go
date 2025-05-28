@@ -2,11 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+const maxMemory = 10 << 20
 
 func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
@@ -28,10 +36,62 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	metadata, err := cfg.db.GetVideo(videoID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to prepare database for video", err)
+		return
+	}
+
+	if userID != metadata.UserID {
+		respondWithError(w, http.StatusUnauthorized, "User does not own the video", nil)
+		return
+	}
 
 	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
 
-	// TODO: implement the upload here
+	r.ParseMultipartForm(maxMemory)
+	file, header, err := r.FormFile("thumbnail")
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Unable to parse form file", err)
+		return
+	}
+	defer file.Close()
 
-	respondWithJSON(w, http.StatusOK, struct{}{})
+	mediatype := header.Header.Get("Content-Type")
+	exts, err := mime.ExtensionsByType(mediatype)
+	if !strings.HasPrefix(mediatype, "image") || err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid thumbnail media type", nil)
+		return
+	}
+
+	var ext string
+	if exts != nil {
+		ext = exts[0]
+	}
+
+	thumbnailFilename := uuid.NewString() + ext
+	thumbnailPath := filepath.Join(cfg.assetsRoot, thumbnailFilename)
+	thumbnailFile, err := os.Create(thumbnailPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to save thumbnail file", err)
+		return
+	}
+	defer thumbnailFile.Close()
+
+	_, err = io.Copy(thumbnailFile, file)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to save form file data", err)
+		return
+	}
+
+	thumbnailURL := "/assets/" + thumbnailFilename
+	metadata.ThumbnailURL = &thumbnailURL
+	metadata.UpdatedAt = time.Now()
+	err = cfg.db.UpdateVideo(metadata)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to update video", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, metadata)
 }
